@@ -1,23 +1,55 @@
-// routes/auth.js — แก้ตรง Steam callback return
+// routes/auth.js
+const express       = require('express');
+const router        = express.Router();
+const passport      = require('passport');
+const SteamStrategy = require('passport-steam').Strategy;
+const jwt           = require('jsonwebtoken');
+const User          = require('../models/User');
 
+const JWT_SECRET = process.env.JWT_SECRET || 'defuse_th_jwt_2024';
+
+// ── Passport Steam Strategy ────────────────────────────
+passport.use(new SteamStrategy(
+  {
+    returnURL: `${process.env.SERVER_URL}/auth/steam/return`,
+    realm:     `${process.env.SERVER_URL}/`,
+    apiKey:    process.env.STEAM_API_KEY,
+  },
+  async (identifier, profile, done) => {
+    try {
+      const steamId = profile.id;
+      let user = await User.findOneAndUpdate(
+        { steamId },
+        {
+          steamId,
+          displayName: profile.displayName,
+          avatar:      profile.photos?.[2]?.value || profile.photos?.[0]?.value || '',
+          profileUrl:  profile._json?.profileurl || '',
+          lastLogin:   new Date(),
+        },
+        { upsert: true, returnDocument: 'after' }
+      );
+      return done(null, profile);
+    } catch (err) {
+      return done(err, null);
+    }
+  }
+));
+
+passport.serializeUser((user, done) => done(null, user));
+passport.deserializeUser((user, done) => done(null, user));
+
+// ── GET /auth/steam ────────────────────────────────────
+router.get('/steam',
+  passport.authenticate('steam', { session: false })
+);
+
+// ── GET /auth/steam/return ─────────────────────────────
 router.get('/steam/return',
   passport.authenticate('steam', { failureRedirect: '/auth/failed', session: false }),
   async (req, res) => {
     try {
       const steamUser = req.user;
-
-      // บันทึก/อัปเดต User ใน MongoDB
-      let user = await User.findOneAndUpdate(
-        { steamId: steamUser.id },
-        {
-          steamId:     steamUser.id,
-          displayName: steamUser.displayName,
-          avatar:      steamUser.photos?.[2]?.value || steamUser.photos?.[0]?.value || '',
-          profileUrl:  steamUser.profileUrl,
-          lastLogin:   new Date(),
-        },
-        { upsert: true, returnDocument: 'after' }  // ✅ แก้ deprecated warning ด้วย
-      );
 
       // สร้าง JWT Token
       const token = jwt.sign(
@@ -30,7 +62,7 @@ router.get('/steam/return',
         { expiresIn: '7d' }
       );
 
-      // ✅ Redirect กลับ App ผ่าน Deep Link พร้อม Token
+      // Redirect กลับ App พร้อม Token
       const appUrl = `myapp://auth/callback?token=${token}&steamId=${steamUser.id}&name=${encodeURIComponent(steamUser.displayName)}`;
       res.redirect(appUrl);
 
@@ -41,7 +73,64 @@ router.get('/steam/return',
   }
 );
 
-// เพิ่ม route สำหรับ failed login
+// ── GET /auth/failed ───────────────────────────────────
 router.get('/failed', (req, res) => {
   res.redirect('myapp://auth/callback?error=login_failed');
 });
+
+// ── POST /auth/mock-login ──────────────────────────────
+router.post('/mock-login', async (req, res) => {
+  try {
+    const { steamId, displayName } = req.body;
+
+    const mockSteamId = steamId || '76561198283624115';
+    const mockName    = displayName || 'TestUser';
+
+    await User.findOneAndUpdate(
+      { steamId: mockSteamId },
+      {
+        steamId:     mockSteamId,
+        displayName: mockName,
+        avatar:      '',
+        lastLogin:   new Date(),
+      },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    const token = jwt.sign(
+      { steamId: mockSteamId, displayName: mockName, avatar: '' },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({ success: true, token, steamId: mockSteamId, displayName: mockName });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── GET /auth/verify ───────────────────────────────────
+router.get('/verify', (req, res) => {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'No token' });
+
+  try {
+    const user = jwt.verify(auth.replace('Bearer ', ''), JWT_SECRET);
+    res.json({ success: true, user });
+  } catch {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// ── GET /auth/user/:steamId ────────────────────────────
+router.get('/user/:steamId', async (req, res) => {
+  try {
+    const user = await User.findOne({ steamId: req.params.steamId });
+    if (!user) return res.status(404).json({ error: 'ไม่พบ User' });
+    res.json({ success: true, user });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;
